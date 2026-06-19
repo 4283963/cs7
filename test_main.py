@@ -1,13 +1,16 @@
 import asyncio
+import random
+import threading
+import time
 import pytest
 from fastapi.testclient import TestClient
-from main import app, calculate_variance, WINDOW_SIZE, _agent_data, _lock
+from main import app, calculate_variance, WINDOW_SIZE, _agent_data, _rw_lock
 
 client = TestClient(app)
 
 
 def setup_function():
-    with _lock:
+    with _rw_lock:
         _agent_data.clear()
 
 
@@ -161,3 +164,77 @@ def test_high_concurrency():
     assert len(data) == 10
     for agent in data:
         assert agent["data_points"] == 20
+
+
+def test_race_condition_dict_iteration_with_writes():
+    errors = []
+    stop_event = threading.Event()
+
+    def writer_thread(writer_id):
+        try:
+            while not stop_event.is_set():
+                for i in range(5):
+                    agent_id = f"writer_{writer_id}_agent_{random.randint(1, 50)}"
+                    client.post(
+                        "/api/v1/telephony/ping",
+                        json={"agent_id": agent_id, "volume": random.uniform(0, 100), "latency": random.uniform(10, 200)}
+                    )
+        except Exception as e:
+            errors.append(("writer", str(e)))
+
+    def monitor_thread():
+        try:
+            while not stop_event.is_set():
+                r = client.get("/api/v1/telephony/agents")
+                assert r.status_code == 200
+                r.json()
+                r2 = client.get(f"/api/v1/telephony/agent/monitor_probe_{random.randint(1, 100)}")
+                assert r2.status_code == 200
+        except Exception as e:
+            errors.append(("monitor", str(e)))
+
+    writers = [threading.Thread(target=writer_thread, args=(i,)) for i in range(5)]
+    monitors = [threading.Thread(target=monitor_thread) for _ in range(3)]
+
+    for t in writers + monitors:
+        t.start()
+
+    time.sleep(2.0)
+
+    stop_event.set()
+    for t in writers + monitors:
+        t.join(timeout=5.0)
+
+    assert len(errors) == 0, f"Concurrency errors occurred: {errors[:5]}"
+
+    with _rw_lock:
+        assert len(_agent_data) > 0
+
+
+def test_dict_changed_size_during_iteration_prevented():
+    errors = []
+
+    def aggressive_writer():
+        for i in range(500):
+            agent_id = f"aggressive_{i}"
+            client.post(
+                "/api/v1/telephony/ping",
+                json={"agent_id": agent_id, "volume": 50.0, "latency": 20.0}
+            )
+
+    def aggressive_reader():
+        try:
+            for _ in range(500):
+                client.get("/api/v1/telephony/agents")
+        except Exception as e:
+            errors.append(str(e))
+
+    t1 = threading.Thread(target=aggressive_writer)
+    t2 = threading.Thread(target=aggressive_reader)
+
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert len(errors) == 0, f"Got errors: {errors[:3]}"

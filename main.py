@@ -1,4 +1,4 @@
-from collections import deque, defaultdict
+from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional
 import math
@@ -43,8 +43,8 @@ class AgentStatus(BaseModel):
     last_update: Optional[datetime]
 
 
-_lock = threading.Lock()
-_agent_data: Dict[str, deque] = defaultdict(lambda: deque(maxlen=WINDOW_SIZE))
+_rw_lock = threading.RLock()
+_agent_data: Dict[str, deque] = {}
 
 
 def calculate_variance(values: List[float]) -> Optional[float]:
@@ -53,6 +53,14 @@ def calculate_variance(values: List[float]) -> Optional[float]:
         return None
     mean = sum(values) / n
     return sum((x - mean) ** 2 for x in values) / n
+
+
+def _get_or_create_deque(agent_id: str) -> deque:
+    dq = _agent_data.get(agent_id)
+    if dq is None:
+        dq = deque(maxlen=WINDOW_SIZE)
+        _agent_data[agent_id] = dq
+    return dq
 
 
 def analyze_agent(agent_id: str) -> AgentStatus:
@@ -70,8 +78,10 @@ def analyze_agent(agent_id: str) -> AgentStatus:
             last_update=None
         )
 
-    volumes = [p.volume for p in points]
-    latencies = [p.latency for p in points]
+    snapshot = list(points)
+
+    volumes = [p.volume for p in snapshot]
+    latencies = [p.latency for p in snapshot]
 
     avg_volume = sum(volumes) / len(volumes)
     variance = calculate_variance(volumes)
@@ -83,14 +93,14 @@ def analyze_agent(agent_id: str) -> AgentStatus:
 
     return AgentStatus(
         agent_id=agent_id,
-        data_points=len(points),
+        data_points=len(snapshot),
         avg_volume=round(avg_volume, 2),
         volume_variance=round(variance, 2) if variance is not None else None,
         volume_std=round(std, 2) if std is not None else None,
         avg_latency=round(avg_latency, 2),
         is_yelling=is_yelling,
         is_silent=is_silent,
-        last_update=points[-1].timestamp
+        last_update=snapshot[-1].timestamp
     )
 
 
@@ -107,8 +117,9 @@ async def telephony_ping(request: PingRequest):
         volume=request.volume,
         latency=request.latency
     )
-    with _lock:
-        _agent_data[request.agent_id].append(point)
+    with _rw_lock:
+        dq = _get_or_create_deque(request.agent_id)
+        dq.append(point)
     return None
 
 
@@ -117,7 +128,7 @@ async def get_agent_status(agent_id: str):
     """
     查询指定坐席最近 10 秒的通话质量分析结果。
     """
-    with _lock:
+    with _rw_lock:
         status_result = analyze_agent(agent_id)
     return status_result
 
@@ -127,7 +138,7 @@ async def get_all_agents():
     """
     查询所有上报过数据的坐席状态。
     """
-    with _lock:
+    with _rw_lock:
         agent_ids = list(_agent_data.keys())
         results = [analyze_agent(aid) for aid in agent_ids]
     return results
