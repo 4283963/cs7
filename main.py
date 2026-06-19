@@ -1,11 +1,22 @@
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
+import json
+import logging
 import math
+import os
 import threading
+import time
+import uuid
 
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, PositiveFloat
+
+try:
+    import redis as redis_lib
+    _REDIS_AVAILABLE = True
+except ImportError:
+    _REDIS_AVAILABLE = False
 
 
 app = FastAPI(
@@ -14,9 +25,23 @@ app = FastAPI(
     version="1.0.0"
 )
 
+logger = logging.getLogger("telephony_audit")
+
 WINDOW_SIZE = 50
 HIGH_VARIANCE_THRESHOLD = 400.0
 LOW_VOLUME_THRESHOLD = 5.0
+
+SILENCE_RATIO_THRESHOLD = 0.80
+LOW_LATENCY_THRESHOLD_MS = 80.0
+MIN_POINTS_FOR_SILENCE_ALERT = 10
+
+REDIS_ALERT_QUEUE_KEY = os.getenv("REDIS_ALERT_QUEUE_KEY", "telephony:alerts:silence")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+ALERT_COOLDOWN_SECONDS = 60
+
+ALERT_TYPE_SILENCE = "agent_silence"
 
 
 class PingRequest(BaseModel):
@@ -40,11 +65,51 @@ class AgentStatus(BaseModel):
     avg_latency: Optional[float]
     is_yelling: bool
     is_silent: bool
+    silence_ratio: Optional[float]
     last_update: Optional[datetime]
+
+
+class SilenceAlert(BaseModel):
+    alert_id: str
+    alert_type: str
+    agent_id: str
+    timestamp: datetime
+    silence_ratio: float
+    avg_latency: float
+    data_points: int
+    avg_volume: float
 
 
 _rw_lock = threading.RLock()
 _agent_data: Dict[str, deque] = {}
+_last_alert_time: Dict[str, float] = {}
+
+_redis_client = None
+_redis_init_lock = threading.Lock()
+
+
+def get_redis_client():
+    global _redis_client
+    if not _REDIS_AVAILABLE:
+        return None
+    with _redis_init_lock:
+        if _redis_client is None:
+            try:
+                pool = redis_lib.ConnectionPool(
+                    host=REDIS_HOST,
+                    port=REDIS_PORT,
+                    db=REDIS_DB,
+                    max_connections=20,
+                    socket_timeout=2.0,
+                    socket_connect_timeout=2.0
+                )
+                _redis_client = redis_lib.Redis(connection_pool=pool)
+                _redis_client.ping()
+                logger.info("Redis client connected: %s:%s/%s", REDIS_HOST, REDIS_PORT, REDIS_DB)
+            except Exception as e:
+                logger.warning("Redis connection failed, alerts will be logged only: %s", e)
+                _redis_client = None
+    return _redis_client
 
 
 def calculate_variance(values: List[float]) -> Optional[float]:
@@ -63,6 +128,59 @@ def _get_or_create_deque(agent_id: str) -> deque:
     return dq
 
 
+def _should_send_alert(agent_id: str) -> bool:
+    now = time.monotonic()
+    last = _last_alert_time.get(agent_id)
+    if last is not None and now - last < ALERT_COOLDOWN_SECONDS:
+        return False
+    _last_alert_time[agent_id] = now
+    return True
+
+
+def _push_silence_alert(agent_id: str, silence_ratio: float, avg_latency: float,
+                        data_points: int, avg_volume: float) -> Optional[str]:
+    alert = SilenceAlert(
+        alert_id=str(uuid.uuid4()),
+        alert_type=ALERT_TYPE_SILENCE,
+        agent_id=agent_id,
+        timestamp=datetime.now(timezone.utc),
+        silence_ratio=round(silence_ratio, 4),
+        avg_latency=round(avg_latency, 2),
+        data_points=data_points,
+        avg_volume=round(avg_volume, 2)
+    )
+    payload = alert.model_dump_json()
+    logger.warning("SILENCE ALERT: agent=%s ratio=%.2f avg_latency=%.1fms points=%d avg_vol=%.1f",
+                   agent_id, silence_ratio, avg_latency, data_points, avg_volume)
+    client = get_redis_client()
+    if client is not None:
+        try:
+            client.rpush(REDIS_ALERT_QUEUE_KEY, payload)
+        except Exception as e:
+            logger.error("Failed to push alert to Redis queue: %s", e)
+    return alert.alert_id
+
+
+def _detect_silence_anomaly(points: List[DataPoint]) -> Optional[Dict]:
+    n = len(points)
+    if n < MIN_POINTS_FOR_SILENCE_ALERT:
+        return None
+
+    low_volume_count = sum(1 for p in points if p.volume < LOW_VOLUME_THRESHOLD)
+    silence_ratio = low_volume_count / n
+    avg_latency = sum(p.latency for p in points) / n
+
+    if silence_ratio >= SILENCE_RATIO_THRESHOLD and avg_latency <= LOW_LATENCY_THRESHOLD_MS:
+        avg_volume = sum(p.volume for p in points) / n
+        return {
+            "silence_ratio": silence_ratio,
+            "avg_latency": avg_latency,
+            "data_points": n,
+            "avg_volume": avg_volume
+        }
+    return None
+
+
 def analyze_agent(agent_id: str) -> AgentStatus:
     points = _agent_data.get(agent_id)
     if not points:
@@ -75,6 +193,7 @@ def analyze_agent(agent_id: str) -> AgentStatus:
             avg_latency=None,
             is_yelling=False,
             is_silent=False,
+            silence_ratio=None,
             last_update=None
         )
 
@@ -88,8 +207,12 @@ def analyze_agent(agent_id: str) -> AgentStatus:
     std = math.sqrt(variance) if variance is not None else None
     avg_latency = sum(latencies) / len(latencies)
 
+    low_volume_count = sum(1 for v in volumes if v < LOW_VOLUME_THRESHOLD)
+    silence_ratio = low_volume_count / len(volumes)
+
     is_yelling = (variance is not None and variance > HIGH_VARIANCE_THRESHOLD) or avg_volume > 85
-    is_silent = avg_volume < LOW_VOLUME_THRESHOLD and len(volumes) >= 10
+    is_silent = silence_ratio >= SILENCE_RATIO_THRESHOLD and len(volumes) >= MIN_POINTS_FOR_SILENCE_ALERT \
+        and avg_latency <= LOW_LATENCY_THRESHOLD_MS
 
     return AgentStatus(
         agent_id=agent_id,
@@ -100,6 +223,7 @@ def analyze_agent(agent_id: str) -> AgentStatus:
         avg_latency=round(avg_latency, 2),
         is_yelling=is_yelling,
         is_silent=is_silent,
+        silence_ratio=round(silence_ratio, 4),
         last_update=snapshot[-1].timestamp
     )
 
@@ -117,9 +241,14 @@ async def telephony_ping(request: PingRequest):
         volume=request.volume,
         latency=request.latency
     )
+    alert_id = None
     with _rw_lock:
         dq = _get_or_create_deque(request.agent_id)
         dq.append(point)
+        snapshot = list(dq)
+        anomaly = _detect_silence_anomaly(snapshot)
+        if anomaly is not None and _should_send_alert(request.agent_id):
+            alert_id = _push_silence_alert(request.agent_id, **anomaly)
     return None
 
 
@@ -146,4 +275,13 @@ async def get_all_agents():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    result = {"status": "ok", "redis": "unavailable"}
+    client = get_redis_client()
+    if client is not None:
+        try:
+            if client.ping():
+                result["redis"] = "connected"
+        except Exception:
+            pass
+    return result
+
